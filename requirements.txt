@@ -1,0 +1,16 @@
+# Core training stack
+unsloth
+trl
+peft
+accelerate
+bitsandbytes
+transformers
+
+# Data
+datasets
+
+# Experiment tracking
+wandb
+
+# Utilities
+huggingface_hub

@@ -1,0 +1,17 @@
+# Data files (too large for git)
+*.jsonl
+*.sql
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Checkpoint dirs
+qwen_*/
+checkpoints/
+
+# Colab junk
+.ipynb_checkpoints/
