@@ -1,0 +1,16 @@
+# Model A: strategy2 only (bug-type conditioned)
+model_name: unsloth/Qwen2.5-Coder-3B-Instruct
+max_seq_length: 2048
+lora_r: 16
+lora_alpha: 16
+lora_dropout: 0.0
+batch_size: 2
+grad_accum: 4
+learning_rate: 2e-4
+num_epochs: 3
+warmup_steps: 50
+val_split: 0.1
+seed: 42
+output_dir: ./qwen_strategy2_checkpoints
+hf_repo: madane007/stratergy2_qwen
+dataset: strategy2_finetune.jsonl
