@@ -1,0 +1,9 @@
+# Core training + inference stack.
+# On CUDA 11.8 hardware (e.g. V100), install torch from the cu118 index instead:
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+torch>=2.6.0
+transformers>=4.48
+trl>=0.14
+peft>=0.10
+accelerate>=1.0
+datasets>=3.0
