@@ -1,0 +1,14 @@
+pedagogical_rl/src/train/grpo.py
+  h_dca3789ba4c3fe 47-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "e95e34adce79665c9b68e0c47292b06a7735cdf2",
+  "prompts": {},
+  "humans": {
+    "h_dca3789ba4c3fe": {
+      "author": "harshit <siy247587@iitd.ac.in>"
+    }
+  }
+}
