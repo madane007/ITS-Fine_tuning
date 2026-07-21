@@ -44,8 +44,8 @@ JUDGE_ID = "Qwen/Qwen2.5-7B-Instruct"
 # GPU placement (4x V100-32GB): pin each model to its OWN card so three
 # device_map="auto" loads don't all pile onto GPU 0. Each ~7B fp16 fits in 32GB.
 TUTOR_GPU = 0     # + LoRA + optimizer + training activations
-STUDENT_GPU = 1
-JUDGE_GPU = 2     # GPU 3 spare (headroom / bump a model here if one OOMs)
+STUDENT_GPU = 0
+JUDGE_GPU = 0     # GPU 3 spare (headroom / bump a model here if one OOMs)
 
 PROBLEMS_PER_STEP = 2      # problems sampled per training step
 GROUP_SIZE = 4             # G: conversations per problem (need >1 for advantages)
