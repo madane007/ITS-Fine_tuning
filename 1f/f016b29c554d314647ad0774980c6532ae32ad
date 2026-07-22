@@ -1,0 +1,40 @@
+pedagogical_rl/src/train/grpo.py
+  s_67c8f2bb6c6242::t_c790458561456f 57-58
+  s_67c8f2bb6c6242::t_49ec3004b2c177 98-137,139-144
+  s_67c8f2bb6c6242::t_72724ec55fbf7b 28
+  s_67c8f2bb6c6242::t_a7824b78cfc762 211,217-225,229-231,238-249,252-256,263
+  s_67c8f2bb6c6242::t_bd5bc05978b56c 279-280,286-287
+pedagogical_rl/src/env/classroom.py
+  s_67c8f2bb6c6242::t_4d76199b9888a3 25
+  s_67c8f2bb6c6242::t_2b38f8fd947fbd 26
+  s_67c8f2bb6c6242::t_ea1205c662fa73 171
+  s_67c8f2bb6c6242::t_2d43277f12b02f 80-85
+  s_67c8f2bb6c6242::t_fcc2e1a40acf06 202
+  s_67c8f2bb6c6242::t_1d72e8189d66fa 198-201,203-214
+pedagogical_rl/scripts/infer.py
+  s_f64df67d8180c2::t_b0ad4adddc1647 1-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "1ff016b29c554d314647ad0774980c6532ae32ad",
+  "prompts": {},
+  "sessions": {
+    "s_67c8f2bb6c6242": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a046a07b-d499-414c-8460-510f8213a0f2",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "harshit <siy247587@iitd.ac.in>"
+    },
+    "s_f64df67d8180c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b9aacb8f-ef88-409f-b2aa-da738710dd44",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "harshit <siy247587@iitd.ac.in>"
+    }
+  }
+}
