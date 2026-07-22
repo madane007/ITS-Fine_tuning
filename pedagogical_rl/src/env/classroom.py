@@ -22,6 +22,8 @@ nothing here.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from ..data.mbpp import Problem
@@ -74,6 +76,12 @@ End with exactly one line: "VERDICT: ACCEPT" or "VERDICT: REJECT".
 """
 
 _JUDGE_RUBRICS = (_JUDGE_LEAKAGE, _JUDGE_HELPFULNESS)
+
+# Sandbox scoring (executor.py) spawns one subprocess per candidate solution and
+# blocks on it -- fully CPU-bound, GPU idle the whole time. subprocess.run releases
+# the GIL while waiting, so a thread pool overlaps these instead of running them one
+# at a time (no need for a process pool).
+_EXECUTOR_WORKERS = 8
 
 
 @dataclass
@@ -160,10 +168,7 @@ class Classroom:
         """Untutored student attempt per problem -> executor results (batched)."""
         chats = [self._solo_chat(p) for p in problems]
         sampled = self.student.generate(chats, n=self.k_solutions)  # [prob][K]
-        return [
-            [functional_reward(p, s) for s in sols]
-            for p, sols in zip(problems, sampled)
-        ]
+        return self._score_grouped(zip(problems, sampled))
 
     def _run_dialogues(self, convs: list[Conversation]) -> None:
         """Batched turn-taking: each step, bucket conversations by whose turn it
@@ -190,10 +195,23 @@ class Classroom:
 
     def _score_solutions(self, convs: list[Conversation]) -> list[list[ExecutionResult]]:
         """Run each conversation's K post-dialog solutions through the executor."""
-        return [
-            [functional_reward(c.problem, s) for s in c.post_dialog_solutions]
-            for c in convs
-        ]
+        return self._score_grouped((c.problem, c.post_dialog_solutions) for c in convs)
+
+    @staticmethod
+    def _score_grouped(
+        groups: Iterable[tuple[Problem, list[str]]],
+    ) -> list[list[ExecutionResult]]:
+        """Score every (problem, solution) pair across all groups concurrently, then
+        regroup -- see _EXECUTOR_WORKERS for why this is threaded."""
+        groups = list(groups)
+        flat = [(p, s) for p, sols in groups for s in sols]
+        with ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS) as pool:
+            flat_results = list(pool.map(lambda ps: functional_reward(*ps), flat))
+        out, i = [], 0
+        for _, sols in groups:
+            out.append(flat_results[i : i + len(sols)])
+            i += len(sols)
+        return out
 
     def _judge_all(self, convs: list[Conversation]) -> list[list[bool]]:
         """Return per-conversation verdict lists (rubrics x judge_samples), batched

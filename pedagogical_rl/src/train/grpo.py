@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import time
 
 import torch
 from peft import LoraConfig, get_peft_model
@@ -53,6 +54,8 @@ K_SOLUTIONS = 4            # K: student solutions for the solve rate (paper uses
 MAX_TURNS = 4
 JUDGE_SAMPLES = 2
 MAX_NEW_TOKENS = 256
+TRAIN_MICROBATCH = 4       # tutor turns per batched forward/backward (was 1-at-a-time;
+                           # raise if VRAM allows -- an 80GB A100 has room to go higher)
 
 LR = 1e-5
 NUM_STEPS = 10
@@ -92,23 +95,53 @@ def tutor_turn_samples(conversation) -> list[tuple[list[dict], str]]:
     return samples
 
 
-def completion_logprob(model, tokenizer, chat: list[dict], completion: str):
-    """Sum of log-probs of `completion` tokens given `chat`, WITH gradients.
-    Returns (summed_logprob, n_tokens)."""
-    prompt_text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-    prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids
-    full_ids = tokenizer(prompt_text + completion, return_tensors="pt").input_ids.to(model.device)
-    n_prompt = prompt_ids.shape[1]
+def batched_completion_logprob(
+    model, tokenizer, items: list[tuple[list[dict], str]]
+) -> list[tuple[torch.Tensor, int]]:
+    """Sum of log-probs of each item's completion tokens given its chat, WITH
+    gradients, computed in ONE padded forward pass for the whole microbatch
+    (replaces doing this one sequence at a time, which left the GPU idle between
+    tiny single-example forward/backward calls). Returns [(summed_logprob,
+    n_tokens), ...] in input order -- identical per-item math to the old
+    single-sequence version, just batched.
+    """
+    prompt_texts = [
+        tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+        for chat, _ in items
+    ]
+    n_prompts = [tokenizer(p, return_tensors="pt").input_ids.shape[1] for p in prompt_texts]
+    full_ids = [
+        tokenizer(p + completion, return_tensors="pt").input_ids[0]
+        for p, (_, completion) in zip(prompt_texts, items)
+    ]
 
-    logits = model(full_ids).logits[:, :-1, :]      # position t predicts token t+1
-    targets = full_ids[:, 1:]
-    # Fused cross-entropy = per-token NLL without materializing a full [L, vocab]
-    # softmax tensor (big for Qwen's ~152k vocab). log-prob = -NLL.
+    max_len = max(ids.shape[0] for ids in full_ids)
+    pad_id = tokenizer.pad_token_id
+    input_ids = torch.full((len(items), max_len), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((len(items), max_len), dtype=torch.long)
+    labels = torch.full((len(items), max_len), -100, dtype=torch.long)   # -100 = ignored by cross_entropy
+    for i, (ids, n_prompt) in enumerate(zip(full_ids, n_prompts)):
+        L = ids.shape[0]
+        input_ids[i, :L] = ids
+        attention_mask[i, :L] = 1
+        labels[i, n_prompt:L] = ids[n_prompt:]     # only the completion's tokens are scored
+
+    input_ids = input_ids.to(model.device)
+    attention_mask = attention_mask.to(model.device)
+    labels = labels.to(model.device)
+
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[:, :-1, :]
+    targets = labels[:, 1:]
+    # Fused cross-entropy = per-token NLL without materializing a full [B, L, vocab]
+    # softmax tensor (big for Qwen's ~152k vocab). log-prob = -NLL. ignore_index makes
+    # padding/prompt positions contribute exactly 0.
     nll = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction="none"
-    )                                                # [L-1]
-    comp_nll = nll[n_prompt - 1:]                    # only the completion's tokens
-    return -comp_nll.sum(), comp_nll.numel()
+        logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+        ignore_index=-100, reduction="none",
+    ).reshape(targets.shape)                        # [B, L-1]
+
+    n_tokens = (targets != -100).sum(dim=1)
+    return [(-nll[i].sum(), int(n_tokens[i])) for i in range(len(items))]
 
 
 def group_advantages(rewards: list[float]) -> list[float]:
@@ -175,40 +208,59 @@ def main():
         # 1-2. rollout (generation under no_grad). Turn the KV cache ON for fast
         #      generation, then OFF for the checkpointed backward pass (they're
         #      mutually exclusive).
+        gen_start = time.perf_counter()
         tutor.model.config.use_cache = True
         with torch.no_grad():
             groups = room.rollout_batch(batch)
         torch.cuda.empty_cache()   # free rollout activations before the loss pass
         tutor.model.config.use_cache = False
+        gen_s = time.perf_counter() - gen_start
 
-        # 3. advantages + 4-5. policy-gradient update. Backward PER TUTOR TURN so each
-        #    turn's graph is freed immediately -> peak memory = one turn, not a whole
-        #    conversation (this is what fixes the OOM on the 7B tutor).
+        # 3. advantages + 4-5. policy-gradient update. Backward PER MICROBATCH (not
+        #    per single turn) so the GPU sees real batched forward/backward work
+        #    instead of many tiny sequential ones -> higher utilization. Peak memory
+        #    is now one microbatch's graph, not a whole step's (still bounded, just
+        #    a bit higher than the old per-turn version -- lower TRAIN_MICROBATCH if
+        #    that doesn't fit).
+        train_start = time.perf_counter()
         optimizer.zero_grad()
         flat = [(r, a) for g in groups
                 for r, a in zip(g, group_advantages([x.reward.total for x in g]))]
-        n_used, step_loss = 0, 0.0
+
+        train_items: list[tuple[list[dict], str, float]] = []  # (chat, completion, weight)
+        n_used = 0
         for result, adv in flat:
             if adv == 0.0:
                 continue                    # no signal in this group
             samples = tutor_turn_samples(result.conversation)
             if not samples:
                 continue
-            for chat, completion in samples:
-                lp, ntok = completion_logprob(tutor.model, tutor.tokenizer, chat, completion)
+            weight = adv / (len(flat) * len(samples))   # mean log-prob, scaled so the step averages cleanly
+            train_items.extend((chat, completion, weight) for chat, completion in samples)
+            n_used += 1
+
+        step_loss = 0.0
+        for i in range(0, len(train_items), TRAIN_MICROBATCH):
+            chunk = train_items[i:i + TRAIN_MICROBATCH]
+            lp_ntok = batched_completion_logprob(
+                tutor.model, tutor.tokenizer, [(chat, completion) for chat, completion, _ in chunk]
+            )
+            loss = 0.0
+            for (_, _, weight), (lp, ntok) in zip(chunk, lp_ntok):
                 if ntok == 0:
                     continue
-                # mean log-prob for this turn, scaled so the whole step averages cleanly
-                loss = -adv * (lp / ntok) / (len(flat) * len(samples))
-                loss.backward()             # per-turn -> frees the graph now
-                step_loss += loss.item()
-            n_used += 1
+                loss = loss - weight * (lp / ntok)
+            if loss == 0.0:
+                continue
+            loss.backward()             # per-microbatch -> frees the graph now
+            step_loss += loss.item()
 
         if n_used > 0:
             torch.nn.utils.clip_grad_norm_(
                 [p for p in tutor.model.parameters() if p.requires_grad], 1.0
             )
             optimizer.step()
+        train_s = time.perf_counter() - train_start
 
         # ---- metrics: aggregate every conversation this step ----
         bd = [r.reward for g in groups for r in g]
@@ -224,12 +276,15 @@ def main():
             "mean_turns": _mean(turns),
             "convs_updated": n_used,
             "loss": step_loss,
+            "gen_s": gen_s,       # wall time in rollout (generation) -- the memory-bound, low-utilization phase
+            "train_s": train_s,   # wall time in the backward loop -- should shrink with bigger TRAIN_MICROBATCH
         }
         print(
             f"step {step:4d} | reward {m['mean_reward']:+.3f} +/-{m['reward_std']:.2f} "
             f"| solve {m['solve_pre']:.2f}->{m['solve_post']:.2f} (d{m['delta_solve']:+.2f}) "
             f"| ped_pass {m['pedagogy_pass']:.2f} | turns {m['mean_turns']:.1f} "
-            f"| upd {n_used} | loss {step_loss:+.3f}"
+            f"| upd {n_used} | loss {step_loss:+.3f} "
+            f"| gen {gen_s:.1f}s | train {train_s:.1f}s"
         )
         with open(METRICS_LOG, "a") as f:
             f.write(json.dumps(m) + "\n")
