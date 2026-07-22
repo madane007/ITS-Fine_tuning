@@ -55,8 +55,8 @@ JUDGE_SAMPLES = 2
 MAX_NEW_TOKENS = 256
 
 LR = 1e-5
-NUM_STEPS = 500
-SAVE_EVERY = 25
+NUM_STEPS = 10
+SAVE_EVERY = 10
 CKPT_DIR = os.environ.get("CKPT_DIR", "./checkpoints")
 METRICS_LOG = os.path.join(CKPT_DIR, "metrics.jsonl")   # one JSON row per step, for plotting
 LAMBDA_PED = 0.75
