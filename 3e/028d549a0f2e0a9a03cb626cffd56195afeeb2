@@ -1,0 +1,19 @@
+pedagogical_rl/scripts/app.py
+  s_951e56c9166dc2::t_718505da08515c 1-245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "3e028d549a0f2e0a9a03cb626cffd56195afeeb2",
+  "prompts": {},
+  "sessions": {
+    "s_951e56c9166dc2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99e329d4-634e-471e-a4b8-00223950f71d",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "harshit <siy247587@iitd.ac.in>"
+    }
+  }
+}
