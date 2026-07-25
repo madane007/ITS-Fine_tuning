@@ -1,25 +1,23 @@
 """
-Evaluate a trained tutor adapter against the BASE tutor.
+Evaluate the BASE tutor and one-or-more trained checkpoints on held-out MBPP.
 
-Runs the same held-out MBPP problems through the full tutoring pipeline twice --
-once with the untrained base tutor, once with the LoRA adapter applied -- and
-reports the paper's two headline metrics:
+Runs the same held-out problems through the tutoring pipeline for each variant
+(base, then each checkpoint) and prints a comparison table of the paper's headline
+metrics, so you can see WHERE training peaked -- RL often improves then degrades,
+so the last checkpoint isn't necessarily the best.
 
-    delta solve rate  = post-dialog solve rate - pre-dialog (untutored) solve rate
-                        -> did tutoring actually help the student?
-    pedagogy pass     = fraction of dialogues where all judges accepted
-                        -> (1 - this) is roughly the leak/unhelpful rate
+    delta_solve   = post-dialog solve rate - pre-dialog (untutored)  -> did it teach?
+    pedagogy_pass = fraction of dialogues all judges accepted        -> did it not leak?
 
-A trained tutor should have HIGHER delta_solve and HIGHER pedagogy_pass than base.
-
-Uses the TEST split (training used "train"), so this is held-out.
-The tutor is loaded once and the adapter applied afterwards, so peak memory is
-one tutor, not two.
+Memory-efficient: loads the tutor once, then hot-swaps LoRA adapters. Any
+checkpoint whose path doesn't exist is skipped, so you can point it at whatever
+checkpoints you actually have.
 
     PYTHONPATH=. python scripts/evaluate.py
 """
 
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -38,12 +36,19 @@ TUTOR_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 STUDENT_ID = "unsloth/Llama-3.2-3B-Instruct"
 JUDGE_ID = "Qwen/Qwen2.5-7B-Instruct"
 
-ADAPTER_PATH = "./step90"       # <-- point this at the downloaded adapter folder
+# label -> adapter path. Edit paths to where YOUR checkpoints are; missing ones
+# are skipped automatically (so it's fine to list all even if you only have some).
+CHECKPOINTS = {
+    "step25": "/data1/waterworx/checkpoints/step25",
+    "step50": "/data1/waterworx/checkpoints/step50",
+    "step75": "/data1/waterworx/checkpoints/step75",
+    "step90": "/data1/waterworx/checkpoints/step90",
+}
 
 TUTOR_GPU, STUDENT_GPU, JUDGE_GPU = 0, 1, 2   # all 0 if single big GPU
 
-N_PROBLEMS = 20        # held-out problems to evaluate on
-GROUP_SIZE = 2         # dialogues per problem (averaging, not GRPO groups here)
+N_PROBLEMS = 25        # held-out problems
+GROUP_SIZE = 2         # dialogues per problem (averaged)
 K_SOLUTIONS = 8        # student solutions per dialogue -> solve rate
 MAX_TURNS = 4
 JUDGE_SAMPLES = 2
@@ -59,8 +64,8 @@ def _mean(xs):
 
 
 def evaluate(tutor, student, judge, problems, label):
-    """Run all problems through the pipeline with this tutor; aggregate metrics."""
-    # Same seed before each variant so the student/judge sampling is comparable.
+    # Re-seed before each variant so student/judge sampling is identical across
+    # variants -> differences are attributable to the TUTOR, not luck.
     random.seed(SEED)
     torch.manual_seed(SEED)
 
@@ -73,67 +78,72 @@ def evaluate(tutor, student, judge, problems, label):
         groups = room.rollout_batch(problems)
 
     bd = [r.reward for g in groups for r in g]
-    turns = [r.conversation.turn_count for g in groups for r in g]
     m = {
         "variant": label,
-        "n_dialogues": len(bd),
         "solve_pre": _mean([b.pre_solve_rate for b in bd]),
         "solve_post": _mean([b.r_sol for b in bd]),
         "delta_solve": _mean([b.delta_solve_rate for b in bd]),
         "pedagogy_pass": _mean([1.0 if b.pedagogy_passed else 0.0 for b in bd]),
         "mean_reward": _mean([b.total for b in bd]),
-        "mean_turns": _mean(turns),
     }
-    print(
-        f"[{label:8s}] solve {m['solve_pre']:.3f}->{m['solve_post']:.3f} "
-        f"(delta {m['delta_solve']:+.3f}) | ped_pass {m['pedagogy_pass']:.3f} "
-        f"| reward {m['mean_reward']:+.3f} | turns {m['mean_turns']:.1f}"
-    )
+    print(f"  [{label:8s}] solve {m['solve_pre']:.3f}->{m['solve_post']:.3f} "
+          f"(delta {m['delta_solve']:+.3f}) | ped_pass {m['pedagogy_pass']:.3f} "
+          f"| reward {m['mean_reward']:+.3f}")
     return m
 
 
 def main():
-    problems = load_mbpp("test")[:N_PROBLEMS]     # held out from training
-    print(f"evaluating on {len(problems)} held-out problems, "
-          f"{GROUP_SIZE} dialogues each\n")
+    problems = load_mbpp("test")[:N_PROBLEMS]
+    print(f"evaluating on {len(problems)} held-out problems, {GROUP_SIZE} dialogues each\n")
 
     print("loading student + judge (frozen)...")
-    student = load_engine(STUDENT_ID, max_new_tokens=MAX_NEW_TOKENS,
-                          device_map={"": STUDENT_GPU})
-    judge = load_engine(JUDGE_ID, max_new_tokens=MAX_NEW_TOKENS,
-                        device_map={"": JUDGE_GPU})
+    student = load_engine(STUDENT_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": STUDENT_GPU})
+    judge = load_engine(JUDGE_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": JUDGE_GPU})
 
     print("loading BASE tutor...")
-    tutor = load_engine(TUTOR_ID, max_new_tokens=MAX_NEW_TOKENS,
-                        device_map={"": TUTOR_GPU})
-    base = evaluate(tutor, student, judge, problems, "base")
+    tutor = load_engine(TUTOR_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": TUTOR_GPU})
 
-    print(f"\napplying adapter from {ADAPTER_PATH} ...")
-    tutor.model = PeftModel.from_pretrained(tutor.model, ADAPTER_PATH)
-    tutor.model.eval()
-    trained = evaluate(tutor, student, judge, problems, "trained")
+    results = []
+    print("\n== evaluating variants ==")
+    results.append(evaluate(tutor, student, judge, problems, "base"))   # base first (unwrapped)
 
-    # ---- verdict ----
-    d_delta = trained["delta_solve"] - base["delta_solve"]
-    d_ped = trained["pedagogy_pass"] - base["pedagogy_pass"]
-    print("\n" + "=" * 62)
-    print(f"delta_solve   base {base['delta_solve']:+.3f} -> trained "
-          f"{trained['delta_solve']:+.3f}   (change {d_delta:+.3f})")
-    print(f"pedagogy_pass base {base['pedagogy_pass']:.3f} -> trained "
-          f"{trained['pedagogy_pass']:.3f}   (change {d_ped:+.3f})")
-    print("=" * 62)
-    if d_delta > 0 and d_ped >= 0:
-        print("RESULT: trained tutor teaches better AND stayed pedagogical.")
-    elif d_delta > 0:
-        print("RESULT: better teaching, but pedagogy dropped -- check for leaking.")
-    elif d_ped > 0:
-        print("RESULT: more pedagogical, but not better at raising solve rate.")
+    available = {n: p for n, p in CHECKPOINTS.items() if os.path.exists(p)}
+    if not available:
+        print("\n(no checkpoint paths exist -- only 'base' evaluated. Edit CHECKPOINTS.)")
     else:
-        print("RESULT: no improvement over base on this sample.")
+        # Wrap once with the first adapter, load the rest as named adapters, hot-swap.
+        names = list(available)
+        tutor.model = PeftModel.from_pretrained(tutor.model, available[names[0]], adapter_name=names[0])
+        for n in names[1:]:
+            tutor.model.load_adapter(available[n], adapter_name=n)
+        for n in names:
+            tutor.model.set_adapter(n)
+            tutor.model.eval()
+            results.append(evaluate(tutor, student, judge, problems, n))
+
+    # ---- comparison table ----
+    print("\n" + "=" * 74)
+    print(f"{'variant':10s} {'solve_pre':>9} {'solve_post':>10} {'delta':>8} {'ped_pass':>9} {'reward':>8}")
+    print("-" * 74)
+    for m in results:
+        print(f"{m['variant']:10s} {m['solve_pre']:>9.3f} {m['solve_post']:>10.3f} "
+              f"{m['delta_solve']:>+8.3f} {m['pedagogy_pass']:>9.3f} {m['mean_reward']:>+8.3f}")
+    print("=" * 74)
+
+    best_delta = max(results, key=lambda m: m["delta_solve"])
+    best_ped = max(results, key=lambda m: m["pedagogy_pass"])
+    best_rew = max(results, key=lambda m: m["mean_reward"])
+    print(f"best delta_solve   : {best_delta['variant']} ({best_delta['delta_solve']:+.3f})")
+    print(f"best pedagogy_pass : {best_ped['variant']} ({best_ped['pedagogy_pass']:.3f})")
+    print(f"best mean_reward   : {best_rew['variant']} ({best_rew['mean_reward']:+.3f})")
+    if best_rew["variant"] == "base":
+        print("\n-> No checkpoint beat base on reward. Training didn't help (yet).")
+    else:
+        print(f"\n-> {best_rew['variant']} is the best tutor. Use that adapter.")
 
     with open(OUT_JSON, "w") as f:
-        json.dump({"base": base, "trained": trained}, f, indent=2)
-    print(f"\nsaved -> {OUT_JSON}")
+        json.dump(results, f, indent=2)
+    print(f"saved -> {OUT_JSON}")
 
 
 if __name__ == "__main__":
