@@ -1,17 +1,17 @@
 """
-Evaluate the BASE tutor and one-or-more trained checkpoints on held-out MBPP.
+Evaluate the BASE tutor and trained checkpoints on held-out MBPP -- vLLM backend.
 
-Runs the same held-out problems through the tutoring pipeline for each variant
-(base, then each checkpoint) and prints a comparison table of the paper's headline
-metrics, so you can see WHERE training peaked -- RL often improves then degrades,
-so the last checkpoint isn't necessarily the best.
+vLLM handles the big generation batches with paged attention (no OOM) and is much
+faster than transformers. The tutor uses vLLM's NATIVE LoRA: one base model, swap
+the adapter per variant with set_adapter() -- no reloading, no merging, no
+hot-swap bug.
+
+All three models share ONE GPU via gpu_memory_utilization splits (must sum < ~0.95).
+On a single 80GB A100 the defaults below fit. If vLLM complains about memory, lower
+the *_MEM fractions.
 
     delta_solve   = post-dialog solve rate - pre-dialog (untutored)  -> did it teach?
     pedagogy_pass = fraction of dialogues all judges accepted        -> did it not leak?
-
-Memory-efficient: loads the tutor once, then hot-swaps LoRA adapters. Any
-checkpoint whose path doesn't exist is skipped, so you can point it at whatever
-checkpoints you actually have.
 
     PYTHONPATH=. python scripts/evaluate.py
 """
@@ -25,32 +25,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from peft import PeftModel
 
 from src.data.mbpp import load_mbpp
 from src.env.classroom import Classroom
-from src.models.engines import load_engine
+from src.models.engines import load_vllm
 
 # ============================ CONFIG ============================
 TUTOR_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
 STUDENT_ID = "unsloth/Llama-3.2-3B-Instruct"
 JUDGE_ID = "Qwen/Qwen2.5-7B-Instruct"
 
-# label -> adapter path. Edit paths to where YOUR checkpoints are; missing ones
-# are skipped automatically (so it's fine to list all even if you only have some).
 CHECKPOINTS = {
     "step30": "./checkpoints/step30",
     "step60": "./checkpoints/step60",
     "step90": "./checkpoints/step90",
 }
 
-# All on GPU 0 (a single-GPU qsub job). If you requested multiple GPUs, spread
-# them out (e.g. 0, 1, 1) to relieve memory pressure.
-TUTOR_GPU, STUDENT_GPU, JUDGE_GPU = 0, 0, 0
+# 3 vLLM models on ONE GPU -> split its memory (fractions of total, sum < ~0.95).
+STUDENT_MEM = 0.20     # 3B  -> ~16GB on an 80GB card
+JUDGE_MEM = 0.35       # 7B  -> ~28GB
+TUTOR_MEM = 0.35       # 7B  -> ~28GB
+# If you have >1 GPU, you can instead give each 0.9 and place them via
+# CUDA_VISIBLE_DEVICES in separate processes -- but one 80GB GPU fits all three.
 
-N_PROBLEMS = 25        # held-out problems
-GROUP_SIZE = 2         # dialogues per problem (averaged)
-K_SOLUTIONS = 8        # student solutions per dialogue -> solve rate
+N_PROBLEMS = 25
+GROUP_SIZE = 2
+K_SOLUTIONS = 8
 MAX_TURNS = 4
 JUDGE_SAMPLES = 2
 MAX_NEW_TOKENS = 256
@@ -64,20 +64,14 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def evaluate(tutor, student, judge, problems, label):
-    # Re-seed before each variant so student/judge sampling is identical across
-    # variants -> differences are attributable to the TUTOR, not luck.
+def evaluate(room, problems, label):
+    # Re-seed so student/judge sampling is comparable across variants -> differences
+    # are attributable to the TUTOR. (vLLM uses its own seeding per request; this
+    # keeps the Python-side problem shuffling identical.)
     random.seed(SEED)
     torch.manual_seed(SEED)
 
-    room = Classroom(
-        tutor, student, judge,
-        group_size=GROUP_SIZE, k_solutions=K_SOLUTIONS,
-        judge_samples=JUDGE_SAMPLES, max_turns=MAX_TURNS, lambda_ped=LAMBDA_PED,
-    )
-    with torch.no_grad():
-        groups = room.rollout_batch(problems)
-
+    groups = room.rollout_batch(problems)
     bd = [r.reward for g in groups for r in g]
     m = {
         "variant": label,
@@ -93,41 +87,31 @@ def evaluate(tutor, student, judge, problems, label):
     return m
 
 
-def load_tutor(adapter_path):
-    """Fresh base tutor, with the adapter MERGED IN (baked into the weights) so
-    there's zero ambiguity about which adapter is active. Reloading per variant is
-    slower but foolproof -- hot-swapping adapters on one model silently failed."""
-    tutor = load_engine(TUTOR_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": TUTOR_GPU})
-    if adapter_path:
-        tutor.model = PeftModel.from_pretrained(tutor.model, adapter_path)
-        tutor.model = tutor.model.merge_and_unload()   # bake adapter into base weights
-    tutor.model.eval()
-    return tutor
-
-
 def main():
-    import gc
-
     problems = load_mbpp("test")[:N_PROBLEMS]
     print(f"evaluating on {len(problems)} held-out problems, {GROUP_SIZE} dialogues each\n")
 
-    print("loading student + judge (frozen)...")
-    student = load_engine(STUDENT_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": STUDENT_GPU})
-    judge = load_engine(JUDGE_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": JUDGE_GPU})
+    print("loading student + judge + tutor on vLLM (shared GPU)...")
+    student = load_vllm(STUDENT_ID, gpu_memory_utilization=STUDENT_MEM, max_new_tokens=MAX_NEW_TOKENS)
+    judge = load_vllm(JUDGE_ID, gpu_memory_utilization=JUDGE_MEM, max_new_tokens=MAX_NEW_TOKENS)
+    tutor = load_vllm(TUTOR_ID, gpu_memory_utilization=TUTOR_MEM, max_new_tokens=MAX_NEW_TOKENS,
+                      enable_lora=True, max_lora_rank=16)
 
-    # base first, then every checkpoint whose path exists
+    room = Classroom(
+        tutor, student, judge,
+        group_size=GROUP_SIZE, k_solutions=K_SOLUTIONS,
+        judge_samples=JUDGE_SAMPLES, max_turns=MAX_TURNS, lambda_ped=LAMBDA_PED,
+    )
+
     variants = [("base", None)]
     variants += [(n, p) for n, p in CHECKPOINTS.items() if os.path.exists(p)]
 
     results = []
-    print("\n== evaluating variants (reloading tutor each time) ==")
+    print("\n== evaluating variants (swapping the tutor's LoRA) ==")
     for name, path in variants:
-        print(f"-- loading tutor: {name}")
-        tutor = load_tutor(path)
-        results.append(evaluate(tutor, student, judge, problems, name))
-        del tutor                      # free the 15GB tutor before the next variant
-        gc.collect()
-        torch.cuda.empty_cache()
+        print(f"-- variant: {name}")
+        tutor.set_adapter(path)          # None = base; else apply that adapter
+        results.append(evaluate(room, problems, name))
 
     # ---- comparison table ----
     print("\n" + "=" * 74)
@@ -138,16 +122,12 @@ def main():
               f"{m['delta_solve']:>+8.3f} {m['pedagogy_pass']:>9.3f} {m['mean_reward']:>+8.3f}")
     print("=" * 74)
 
-    best_delta = max(results, key=lambda m: m["delta_solve"])
-    best_ped = max(results, key=lambda m: m["pedagogy_pass"])
-    best_rew = max(results, key=lambda m: m["mean_reward"])
-    print(f"best delta_solve   : {best_delta['variant']} ({best_delta['delta_solve']:+.3f})")
-    print(f"best pedagogy_pass : {best_ped['variant']} ({best_ped['pedagogy_pass']:.3f})")
-    print(f"best mean_reward   : {best_rew['variant']} ({best_rew['mean_reward']:+.3f})")
-    if best_rew["variant"] == "base":
-        print("\n-> No checkpoint beat base on reward. Training didn't help (yet).")
+    best = max(results, key=lambda m: m["mean_reward"])
+    print(f"best mean_reward: {best['variant']} ({best['mean_reward']:+.3f})")
+    if best["variant"] == "base":
+        print("-> No checkpoint beat base. Training didn't help (yet).")
     else:
-        print(f"\n-> {best_rew['variant']} is the best tutor. Use that adapter.")
+        print(f"-> {best['variant']} is the best tutor. Use that adapter.")
 
     with open(OUT_JSON, "w") as f:
         json.dump(results, f, indent=2)
