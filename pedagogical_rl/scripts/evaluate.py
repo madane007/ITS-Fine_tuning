@@ -39,13 +39,14 @@ JUDGE_ID = "Qwen/Qwen2.5-7B-Instruct"
 # label -> adapter path. Edit paths to where YOUR checkpoints are; missing ones
 # are skipped automatically (so it's fine to list all even if you only have some).
 CHECKPOINTS = {
-    "step25": "/data1/waterworx/checkpoints/step25",
-    "step50": "/data1/waterworx/checkpoints/step50",
-    "step75": "/data1/waterworx/checkpoints/step75",
-    "step90": "/data1/waterworx/checkpoints/step90",
+    "step30": "./checkpoints/step30",
+    "step60": "./checkpoints/step60",
+    "step90": "./checkpoints/step90",
 }
 
-TUTOR_GPU, STUDENT_GPU, JUDGE_GPU = 0, 1, 2   # all 0 if single big GPU
+# All on GPU 0 (a single-GPU qsub job). If you requested multiple GPUs, spread
+# them out (e.g. 0, 1, 1) to relieve memory pressure.
+TUTOR_GPU, STUDENT_GPU, JUDGE_GPU = 0, 0, 0
 
 N_PROBLEMS = 25        # held-out problems
 GROUP_SIZE = 2         # dialogues per problem (averaged)
