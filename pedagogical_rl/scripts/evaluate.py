@@ -92,7 +92,21 @@ def evaluate(tutor, student, judge, problems, label):
     return m
 
 
+def load_tutor(adapter_path):
+    """Fresh base tutor, with the adapter MERGED IN (baked into the weights) so
+    there's zero ambiguity about which adapter is active. Reloading per variant is
+    slower but foolproof -- hot-swapping adapters on one model silently failed."""
+    tutor = load_engine(TUTOR_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": TUTOR_GPU})
+    if adapter_path:
+        tutor.model = PeftModel.from_pretrained(tutor.model, adapter_path)
+        tutor.model = tutor.model.merge_and_unload()   # bake adapter into base weights
+    tutor.model.eval()
+    return tutor
+
+
 def main():
+    import gc
+
     problems = load_mbpp("test")[:N_PROBLEMS]
     print(f"evaluating on {len(problems)} held-out problems, {GROUP_SIZE} dialogues each\n")
 
@@ -100,26 +114,19 @@ def main():
     student = load_engine(STUDENT_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": STUDENT_GPU})
     judge = load_engine(JUDGE_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": JUDGE_GPU})
 
-    print("loading BASE tutor...")
-    tutor = load_engine(TUTOR_ID, max_new_tokens=MAX_NEW_TOKENS, device_map={"": TUTOR_GPU})
+    # base first, then every checkpoint whose path exists
+    variants = [("base", None)]
+    variants += [(n, p) for n, p in CHECKPOINTS.items() if os.path.exists(p)]
 
     results = []
-    print("\n== evaluating variants ==")
-    results.append(evaluate(tutor, student, judge, problems, "base"))   # base first (unwrapped)
-
-    available = {n: p for n, p in CHECKPOINTS.items() if os.path.exists(p)}
-    if not available:
-        print("\n(no checkpoint paths exist -- only 'base' evaluated. Edit CHECKPOINTS.)")
-    else:
-        # Wrap once with the first adapter, load the rest as named adapters, hot-swap.
-        names = list(available)
-        tutor.model = PeftModel.from_pretrained(tutor.model, available[names[0]], adapter_name=names[0])
-        for n in names[1:]:
-            tutor.model.load_adapter(available[n], adapter_name=n)
-        for n in names:
-            tutor.model.set_adapter(n)
-            tutor.model.eval()
-            results.append(evaluate(tutor, student, judge, problems, n))
+    print("\n== evaluating variants (reloading tutor each time) ==")
+    for name, path in variants:
+        print(f"-- loading tutor: {name}")
+        tutor = load_tutor(path)
+        results.append(evaluate(tutor, student, judge, problems, name))
+        del tutor                      # free the 15GB tutor before the next variant
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # ---- comparison table ----
     print("\n" + "=" * 74)
